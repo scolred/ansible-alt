@@ -1,0 +1,9 @@
+sed -i 's/\r$//' install_cryptopro.sh
+chmod +x install_cryptopro.sh
+bash install_cryptopro.sh
+==============
+else if not help
+use this
+=========
+cat install_cryptopro.sh | tr -d '\r' > install_cryptopro_fixed.sh
+mv install_cryptopro_fixed.sh install_cryptopro.sh

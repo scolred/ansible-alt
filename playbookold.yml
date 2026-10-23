@@ -1,0 +1,141 @@
+- name: Автоустановка КриптоПро CSP и Kaspersky на ALT Linux
+  hosts: alt
+  become: true
+  vars:
+    remote_dist_dir: "/tmp/distrib"
+    # Если есть ключ лицензии КриптоПро, впишите сюда:
+    cryptopro_license: ""
+
+  tasks:
+    # -------------------------------------------------------------
+    # 0. Подготовка окружения и зависимостей ALT Linux
+    # -------------------------------------------------------------
+    - name: Создать временную директорию под дистрибутивы
+      ansible.builtin.file:
+        path: "{{ remote_dist_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Установить системные зависимости (cryptopro-preinstall, pcscd)
+      ansible.builtin.raw: apt-get update && apt-get install -y cryptopro-preinstall pcsc-lite pcscd newt52 || true
+
+    # -------------------------------------------------------------
+    # 1. Тихая установка КриптоПро CSP
+    # -------------------------------------------------------------
+    - name: Скопировать папку КриптоПро на хост
+      ansible.builtin.copy:
+        src: files/cryptopro/
+        dest: "{{ remote_dist_dir }}/cryptopro/"
+        mode: '0755'
+
+    - name: Выполнить тихую установку КриптоПро (kc1 + GUI + ридеры + CAdES)
+      ansible.builtin.shell: |
+        cd {{ remote_dist_dir }}/cryptopro
+        # Установка базовых компонентов без диалогов
+        sh ./install.sh kc1 cprocsp-rdr-gui-gtk cprocsp-rdr-rutoken cprocsp-rdr-pcsc cprocsp-rdr-jacarta lsb-cprocsp-pkcs11
+        # Установка CAdES плагина для браузера
+        rpm -Uvh --replacepkgs cprocsp-pki-*.rpm || true
+      register: cp_install
+      changed_when: cp_install.rc == 0
+
+    - name: Настроить считыватель HDIMAGE и включить службы
+      ansible.builtin.shell: |
+        /opt/cprocsp/sbin/amd64/cpconfig -hardware reader -add HDIMAGE store 2>/dev/null || true
+        /opt/cprocsp/sbin/amd64/cpconfig -hardware reader -add FLASH store 2>/dev/null || true
+        systemctl enable --now cprocsp || /etc/init.d/cprocsp start || true
+        systemctl enable --now pcscd || true
+
+    - name: Активировать лицензию КриптоПро (если задана)
+      ansible.builtin.command:
+        cmd: "/opt/cprocsp/sbin/amd64/cpconfig -license -set {{ cryptopro_license }}"
+      when: cryptopro_license | length > 0
+      no_log: true
+
+    # -------------------------------------------------------------
+    # 2. Установка Kaspersky Network Agent (klnagent64)
+    # -------------------------------------------------------------
+    - name: Скопировать файл автоответов Касперского
+      ansible.builtin.copy:
+        src: files/klnagent_answers.conf
+        dest: "{{ remote_dist_dir }}/klnagent_answers.conf"
+        mode: '0644'
+
+    - name: Скопировать RPM-пакет Агента Касперского
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ remote_dist_dir }}/"
+      with_fileglob:
+        - "files/klnagent64-*.rpm"
+        - "files/klnagent-*.rpm"
+
+    - name: Тихая установка и первоначальная настройка klnagent64
+      ansible.builtin.shell: |
+        # Экспортируем переменную с файлом ответов для инсталлятора
+        export KLAUTOANSWERS="{{ remote_dist_dir }}/klnagent_answers.conf"
+        
+        # Устанавливаем сам RPM пакет
+        rpm -Uvh --replacepkgs {{ remote_dist_dir }}/klnagent*.rpm || true
+        
+        # Запускаем скрипт пост-конфигурации с файлом ответов
+        if [ -f /opt/kaspersky/klnagent64/lib/bin/setup/postinstall.pl ]; then
+          /opt/kaspersky/klnagent64/lib/bin/setup/postinstall.pl --auto-answers="{{ remote_dist_dir }}/klnagent_answers.conf"
+        elif [ -f /opt/kaspersky/klnagent/lib/bin/setup/postinstall.pl ]; then
+          /opt/kaspersky/klnagent/lib/bin/setup/postinstall.pl --auto-answers="{{ remote_dist_dir }}/klnagent_answers.conf"
+        fi
+      register: klnagent_install
+      changed_when: klnagent_install.rc == 0
+
+    - name: Запустить и включить службу Агента Касперского
+      ansible.builtin.systemd:
+        name: klnagent64
+        enabled: true
+        state: started
+      ignore_errors: true
+
+    # -------------------------------------------------------------
+    # 3. Установка Kaspersky Endpoint Security (KESL)
+    # -------------------------------------------------------------
+    - name: Скопировать RPM-пакет KESL
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ remote_dist_dir }}/"
+      with_fileglob:
+        - "files/kesl-*.rpm"
+
+    - name: Установить KESL и применить автоконфигурацию
+      ansible.builtin.shell: |
+        rpm -Uvh --replacepkgs {{ remote_dist_dir }}/kesl-*.rpm || true
+        
+        # Запуск пост-установки KESL с автосогласием EULA
+        if [ -f /opt/kaspersky/kesl/bin/kesl-setup.pl ]; then
+          /opt/kaspersky/kesl/bin/kesl-setup.pl --autoinstall="{{ remote_dist_dir }}/klnagent_answers.conf" || \
+          /opt/kaspersky/kesl/bin/kesl-setup.pl -E
+        fi
+      register: kesl_install
+      changed_when: kesl_install.rc == 0
+
+    - name: Запустить службу KESL
+      ansible.builtin.systemd:
+        name: kesl
+        enabled: true
+        state: started
+      ignore_errors: true
+
+    # -------------------------------------------------------------
+    # 4. Проверка и очистка
+    # -------------------------------------------------------------
+    - name: Проверить статус соединения klnagent с KSC сервером
+      ansible.builtin.command:
+        cmd: "/opt/kaspersky/klnagent64/bin/klnagchk"
+      register: klnagchk_out
+      changed_when: false
+      ignore_errors: true
+
+    - name: Вывести результат klnagchk в консоль
+      ansible.builtin.debug:
+        var: klnagchk_out.stdout_lines
+
+    - name: Удалить временные файлы
+      ansible.builtin.file:
+        path: "{{ remote_dist_dir }}"
+        state: absent
